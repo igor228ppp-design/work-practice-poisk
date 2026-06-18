@@ -1,91 +1,118 @@
 import c104
-import random
 import time
 
-# Функция обратного вызова (callback), которая срабатывает при получении неожиданных сообщений от сервера
-def con_on_unexpected_message(connection: c104.Connection, message: c104.IncomingMessage, cause: c104.Umc) -> None:
-    # Проверяем причину: если это ошибка несоответствия типа данных (Type ID)
-    if cause == c104.Umc.MISMATCHED_TYPE_ID :
-        # Получаем станцию по ее общему адресу (Common Address)
+# ─────────────────────────────────────────────
+# Конфигурация клиента
+# ─────────────────────────────────────────────
+
+SERVER_IP: str              = "127.0.0.1"
+SERVER_PORT: int            = 2404
+STATION_COMMON_ADDRESS: int = 47
+TEMP_IO_ADDRESS: int        = 11
+CMD_IO_ADDRESS: int         = 12
+CONNECT_TIMEOUT_S: int      = 30    # максимальное время ожидания подключения, секунд
+
+
+# ─────────────────────────────────────────────
+# Колбэк: неожиданные сообщения от сервера
+# ─────────────────────────────────────────────
+
+def con_on_unexpected_message(
+    connection: c104.Connection,
+    message: c104.IncomingMessage,
+    cause: c104.Umc,
+) -> None:
+    """Обрабатывает неожиданные или ошибочные сообщения от сервера."""
+    if cause == c104.Umc.MISMATCHED_TYPE_ID:
         station = connection.get_station(message.common_address)
         if station:
-            # Получаем точку (point) по ее адресу ввода-вывода (IOA)
             point = station.get_point(message.io_address)
             if point:
-                # Выводим предупреждение о конфликте, если тип в сообщении отличается от зарегистрированного
-                print("CL] <-in-- КОНФЛИКТ | СЕРВЕР CA {0} сообщает тип IOA {1} как {2}, но он уже зарегистрирован как {3}".format(message.common_address, message.io_address, message.type, point.type))
+                print(
+                    "[CL] <-in-- КОНФЛИКТ | СЕРВЕР CA {0} сообщает тип IOA {1} "
+                    "как {2}, но он уже зарегистрирован как {3}".format(
+                        message.common_address,
+                        message.io_address,
+                        message.type,
+                        point.type,
+                    )
+                )
                 return
-    # Выводим информацию об отклоненном запросе или ошибке
-    print("CL] <-in-- ОТКЛОНЕНО | {1} от СЕРВЕРА CA {0}".format(message.common_address, cause))
 
-def main():
-    # --- 1. Подготовка клиента, подключения и станции ---
-    
-    # Создаем экземпляр клиента протокола МЭК 60870-5-104 (IEC 104)
+    print(
+        "[CL] <-in-- ОТКЛОНЕНО | {1} от СЕРВЕРА CA {0}".format(
+            message.common_address, cause
+        )
+    )
+
+
+# ─────────────────────────────────────────────
+# Точка входа
+# ─────────────────────────────────────────────
+
+def main() -> None:
+    # ── 1. Создание клиента и подключения ───
     client = c104.Client()
-    
-    # Добавляем новое подключение к серверу (указываем IP и стандартный порт 2404). 
-    # Флаг init=c104.Init.ALL означает, что при подключении будут выполнены все процедуры инициализации
-    connection = client.add_connection(ip="127.0.0.1", port=2404, init=c104.Init.ALL)
-    
-    # Назначаем функцию, которая будет обрабатывать непредвиденные сообщения от сервера
+
+    connection = client.add_connection(
+        ip=SERVER_IP,
+        port=SERVER_PORT,
+        init=c104.Init.ALL,
+    )
     connection.on_unexpected_message(callable=con_on_unexpected_message)
-    
-    # Добавляем станцию с общим адресом (Common Address) = 47
-    station = connection.add_station(common_address=47)
 
-    # --- 2. Подготовка точек данных ---
-    
-    # Добавляем точку для телеизмерения температуры с адресом IOA = 11. 
-    # ВНИМАНИЕ: Изменен тип на M_ME_TF_1 для приема реальных дробных чисел температуры от сервера
-    point = station.add_point(io_address=11, type=c104.Type.M_ME_TF_1)
+    # ── 2. Добавление станции и точек ───────
+    station = connection.add_station(common_address=STATION_COMMON_ADDRESS)
 
-    # Добавляем точку для телеуправления с адресом IOA = 12. 
-    # Тип C_RC_TA_1 — команда управления с двумя состояниями (регулирование)
-    command = station.add_point(io_address=12, type=c104.Type.C_RC_TA_1)
-    
-    # Устанавливаем значение команды (например, "увеличить" или "повысить")
+    # Точка температуры (M_ME_TF_1 — float с меткой времени)
+    point = station.add_point(io_address=TEMP_IO_ADDRESS, type=c104.Type.M_ME_TF_1)
+
+    # Точка команды (C_RC_TA_1 — пошаговая команда с меткой времени)
+    command = station.add_point(io_address=CMD_IO_ADDRESS, type=c104.Type.C_RC_TA_1)
     command.value = c104.Step.HIGHER
 
-    # --- 3. Запуск клиента и ожидание соединения ---
-    
-    # Запускаем фоновый поток клиента для работы с сетью
+    # ── 3. Запуск клиента ───────────────────
     client.start()
+    print(f"Подключение к {SERVER_IP}:{SERVER_PORT}...")
 
-    # Блокируем выполнение, пока соединение с сервером не перейдет в статус OPEN (установлено)
+    # ── 4. Ожидание установки соединения ────
+    waited = 0
     while connection.state != c104.ConnectionState.OPEN:
-        print("Ожидание подключения к {0}:{1}...".format(connection.ip, connection.port))
+        if waited >= CONNECT_TIMEOUT_S:
+            print(
+                f"[ОШИБКА] Не удалось подключиться к {SERVER_IP}:{SERVER_PORT} "
+                f"за {CONNECT_TIMEOUT_S} секунд. Завершаем."
+            )
+            client.stop()
+            return
+        print(f"Ожидание подключения... ({waited}/{CONNECT_TIMEOUT_S} с)")
         time.sleep(1)
+        waited += 1
 
-    # Выводим текущее значение точки после инициализации подключения
+    print(f"Соединение установлено.")
     print(f"-> ПОСЛЕ ИНИЦИАЛИЗАЦИИ: {point.value}")
 
-    # --- 4. Чтение данных (Запрос опроса) ---
-    
-    print("Выполняем чтение...")
-    
-    # Отправляем запрос на чтение (опрос) значения точки с адресом 11
+    # ── 5. Чтение температуры ───────────────
+    print("\nВыполняем чтение температуры...")
     if point.read():
-        print(f"-> УСПЕШНО Получена температура CPU: {point.value} °C") # В случае успеха выводим полученное значение
+        print(f"-> УСПЕШНО | Температура CPU: {point.value} °C")
     else:
-        print("-> ОШИБКА при чтении данных")              # Если произошла ошибка запроса
+        print("-> ОШИБКА при чтении данных")
 
-    # --- 5. Отправка команды управления ---
-    
-    print("Выполняем передачу команды...")
-    
-    # Передаем команду телеуправления (cause=c104.Cot.ACTIVATION — причина активации)
+    # ── 6. Отправка команды управления ──────
+    print("\nВыполняем передачу команды...")
     if command.transmit(cause=c104.Cot.ACTIVATION):
-        print("-> УСПЕШНО Команда отправлена") # Команда успешно отправлена
+        print(f"-> УСПЕШНО | Команда {command.value} отправлена")
     else:
-        print("-> ОШИБКА при отправке команды") # Ошибка отправки команды
+        print("-> ОШИБКА при отправке команды")
 
-    # Ожидаем 3 секунды, чтобы сервер успел обработать команду
+    # Ожидаем подтверждения от сервера
     time.sleep(3)
 
-    # --- 6. Завершение работы ---
-    
-    print("Выход из программы")
+    # ── 7. Завершение работы ────────────────
+    print("\nЗавершение работы клиента...")
+    client.stop()
+    print("Клиент остановлен. До свидания!")
 
 
 if __name__ == "__main__":
