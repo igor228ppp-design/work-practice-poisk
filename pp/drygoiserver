@@ -1,0 +1,42 @@
+import c104
+import time
+
+def on_unexpected(connection: c104.Connection, message: c104.IncomingMessage, cause: c104.Umc) -> None:
+    print(f"[КЛИЕНТ] Неожиданное сообщение: {cause}")
+
+
+# ─── Подключение ──────────────────────────────
+
+client     = c104.Client()
+connection = client.add_connection(ip="127.0.0.1", port=2404, init=c104.Init.ALL)
+connection.on_unexpected_message(callable=on_unexpected)
+
+station = connection.add_station(common_address=47)
+point   = station.add_point(io_address=11, type=c104.Type.M_ME_TF_1)
+
+client.start()
+print("Подключение к серверу...")
+
+# Ждём соединения (не более 30 секунд)
+for _ in range(30):
+    if connection.state == c104.ConnectionState.OPEN:
+        break
+    time.sleep(1)
+else:
+    print("Ошибка: не удалось подключиться за 30 секунд.")
+    client.stop()
+    exit(1)
+
+print("Подключено! Получаем температуру в реальном времени...\n")
+
+# ─── Чтение температуры в реальном времени ───
+
+try:
+    while True:
+        point.read()
+        print(f"Температура CPU: {point.value} °C")
+        time.sleep(1)
+except KeyboardInterrupt:
+    print("\nОстановлено пользователем.")
+
+client.stop()
