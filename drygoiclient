@@ -1,0 +1,65 @@
+import c104
+import time
+import subprocess
+import re
+import signal
+import sys
+
+running = True
+
+def signal_handler(sig, frame):
+    global running
+    print("Останавливаем сервер...")
+    running = False
+
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+
+
+def get_temperature() -> float:
+    """Читает температуру CPU через sensors. Возвращает 0.0 при ошибке."""
+    try:
+        result = subprocess.run(["sensors"], capture_output=True, text=True, timeout=5)
+        match = re.search(r"\+(\d+\.\d+)°", result.stdout)
+        if match:
+            return float(match.group(1))
+    except Exception:
+        pass
+    return 0.0
+
+
+def on_transmit(point: c104.Point) -> None:
+    """Вызывается перед каждой отправкой — обновляем температуру."""
+    temp = get_temperature()
+    point.value = temp
+    print(f"[СЕРВЕР] Отправка температуры: {temp} °C")
+
+
+def on_read(point: c104.Point) -> None:
+    """Вызывается при запросе клиента."""
+    temp = get_temperature()
+    point.value = temp
+    print(f"[СЕРВЕР] Запрос клиента, температура: {temp} °C")
+
+
+# ─── Запуск сервера ───────────────────────────
+
+server  = c104.Server(ip="0.0.0.0", port=2404)
+station = server.add_station(common_address=47)
+
+point = station.add_point(
+    io_address=11,
+    type=c104.Type.M_ME_TF_1,
+    report_ms=1000,          # отправлять клиенту каждую секунду
+)
+point.on_before_auto_transmit(callable=on_transmit)
+point.on_before_read(callable=on_read)
+
+server.start()
+print("Сервер запущен на порту 2404. Ожидание клиентов...")
+
+while running:
+    time.sleep(1)
+
+server.stop()
+print("Сервер остановлен.")
