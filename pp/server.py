@@ -1,97 +1,272 @@
 import c104
-import random
 import time
 import subprocess
 import re
+import logging
+import signal
+import sys
 
-def get_cpu_temperature_via_sensors() -> float:
-    """ Получает реальную температуру процессора, выполняя консольную команду 'sensors' """
-    try:
-        # Выполняем команду 'sensors' в консоли Linux
-        result = subprocess.run(['sensors'], capture_output=True, text=True, check=True)
-        
-        # Перебираем строки из вывода консоли
-        for line in result.stdout.split('\n'):
-            # Ищем строки, содержащие типичные маркеры температуры CPU (Core, CPU, Tctl, temp1)
-            if any(marker in line for marker in ['Core 0', 'CPU', 'Tctl', 'temp1']):
-                # Используем регулярное выражение для поиска числа с плюсом и точкой (например, +45.2°C)
-                match = re.search(r'\+(\d+\.\d+)°', line)
-                if match:
-                    # Преобразуем найденный текст в число с плавающей запятой
-                    return float(match.group(1))
-                    
-        # Если маркеры не найдены, пробуем забрать любое первое попавшееся значение температуры из вывода
-        match = re.search(r'\+(\d+\.\d+)°', result.stdout)
-        if match:
-            return float(match.group(1))
-            
-        return 0.0
-    except Exception as e:
-        # Если утилита 'sensors' не установлена или произошла ошибка, возвращаем 0.0
-        return 0.0
+# ─────────────────────────────────────────────
+# Настройка логирования
+# ─────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler("iec104_server.log", encoding="utf-8"),
+    ],
+)
+log = logging.getLogger(__name__)
+
+# ─────────────────────────────────────────────
+# Глобальный флаг для корректного завершения
+# ─────────────────────────────────────────────
+running: bool = True
 
 
-def on_step_command(point: c104.Point, previous_info: c104.Information, message: c104.IncomingMessage) -> c104.ResponseState:
-    """ Обработка входящей пошаговой команды регулирования (телеуправления)
+def signal_handler(sig, frame) -> None:
+    """Обработчик сигналов ОС (Ctrl+C, SIGTERM) для graceful shutdown."""
+    global running
+    log.info("Получен сигнал завершения (%s). Останавливаем сервер...", sig)
+    running = False
+
+
+# ─────────────────────────────────────────────
+# Получение температуры CPU
+# ─────────────────────────────────────────────
+
+# Маркеры строк, которые содержат температуру CPU
+CPU_TEMP_MARKERS: tuple[str, ...] = ("Core 0", "CPU", "Tctl", "temp1")
+
+# Регулярное выражение для поиска температуры вида «+45.2°C»
+TEMP_PATTERN = re.compile(r"\+(\d+\.\d+)°")
+
+# Последнее успешно считанное значение (используется как fallback)
+_last_known_temp: float = 0.0
+
+
+def get_cpu_temperature_via_sensors() -> tuple[float, bool]:
     """
-    print("{0} ПОШАГОВАЯ КОМАНДА на IOA: {1}, сообщение: {2}, предыдущее: {3}, текущее: {4}".format(point.type, point.io_address, message, previous_info, point.info))
+    Считывает температуру CPU через утилиту ``sensors`` (lm-sensors).
 
-    if point.value == c104.Step.LOWER:
-        return c104.ResponseState.SUCCESS 
+    Возвращает:
+        Кортеж (температура_в_цельсиях, успех).
+        При ошибке возвращает последнее известное значение и False.
+    """
+    global _last_known_temp
 
-    if point.value == c104.Step.HIGHER:
-        return c104.ResponseState.SUCCESS 
+    try:
+        result = subprocess.run(
+            ["sensors"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=5,
+        )
+    except FileNotFoundError:
+        log.warning("Утилита 'sensors' не найдена. Установите пакет lm-sensors.")
+        return _last_known_temp, False
+    except subprocess.TimeoutExpired:
+        log.warning("Команда 'sensors' не ответила за 5 секунд.")
+        return _last_known_temp, False
+    except subprocess.CalledProcessError as exc:
+        log.warning("Ошибка выполнения 'sensors': %s", exc)
+        return _last_known_temp, False
 
+    # Ищем температуру по приоритетным маркерам
+    for line in result.stdout.splitlines():
+        if any(marker in line for marker in CPU_TEMP_MARKERS):
+            match = TEMP_PATTERN.search(line)
+            if match:
+                temp = float(match.group(1))
+                log.debug("Найдена температура CPU: %.1f °C (строка: %r)", temp, line)
+                _last_known_temp = temp
+                return temp, True
+
+    # Запасной вариант — первое найденное значение
+    match = TEMP_PATTERN.search(result.stdout)
+    if match:
+        temp = float(match.group(1))
+        log.debug("Температура CPU (запасной вариант): %.1f °C", temp)
+        _last_known_temp = temp
+        return temp, True
+
+    log.warning("Температура CPU не найдена в выводе 'sensors'.")
+    return _last_known_temp, False
+
+
+# ─────────────────────────────────────────────
+# Колбэки точек данных
+# ─────────────────────────────────────────────
+
+def on_step_command(
+    point: c104.Point,
+    previous_info: c104.Information,
+    message: c104.IncomingMessage,
+) -> c104.ResponseState:
+    """
+    Обработка входящей пошаговой команды регулирования (C_RC_TA_1).
+
+    Поддерживаемые значения:
+        * Step.LOWER  — уменьшить уставку
+        * Step.HIGHER — увеличить уставку
+    """
+    log.info(
+        "[%s] КОМАНДА на IOA %d | prev=%s | cur=%s | msg=%s",
+        point.type,
+        point.io_address,
+        previous_info,
+        point.info,
+        message,
+    )
+
+    if point.value in (c104.Step.LOWER, c104.Step.HIGHER):
+        log.info("Команда %s выполнена успешно.", point.value)
+        return c104.ResponseState.SUCCESS
+
+    log.warning("Неизвестное значение команды: %s", point.value)
     return c104.ResponseState.FAILURE
 
 
 def before_auto_transmit(point: c104.Point) -> None:
-    """ Обновление значения точки перед автоматической циклической отправкой
     """
-    # Вызываем консольную команду и записываем реальную температуру в точку данных
-    point.value = get_cpu_temperature_via_sensors()
-    print("{0} ПЕРЕД АВТОМАТИЧЕСКИМ ОТЧЕТОМ на IOA: {1} ТЕМПЕРАТУРА CPU: {2} °C".format(point.type, point.io_address, point.value))
+    Обновляет значение точки перед автоматической циклической отправкой.
+    Вызывается каждые ``report_ms`` миллисекунд.
+    """
+    temp, ok = get_cpu_temperature_via_sensors()
+    point.value = temp
+
+    if not ok:
+        log.warning(
+            "[%s] АВТО-ОТЧЁТ на IOA %d | ошибка чтения, передаём последнее значение: %.1f °C",
+            point.type,
+            point.io_address,
+            temp,
+        )
+    else:
+        log.info(
+            "[%s] АВТО-ОТЧЁТ на IOA %d | температура CPU: %.1f °C",
+            point.type,
+            point.io_address,
+            temp,
+        )
 
 
 def before_read(point: c104.Point) -> None:
-    """ Обновление значения точки перед обработкой запроса на чтение или общего опроса
     """
-    # Обновляем значение актуальной температурой при запросе от клиента
-    point.value = get_cpu_temperature_via_sensors()
-    print("{0} ПЕРЕД ЧТЕНИЕМ или ОБЩИМ ОПРОСОМ на IOA: {1} ТЕМПЕРАТУРА CPU: {2} °C".format(point.type, point.io_address, point.value))
+    Обновляет значение точки по запросу клиента (READ или общий опрос).
+    """
+    temp, ok = get_cpu_temperature_via_sensors()
+    point.value = temp
+
+    if not ok:
+        log.warning(
+            "[%s] ЗАПРОС ЧТЕНИЯ на IOA %d | ошибка чтения, передаём последнее значение: %.1f °C",
+            point.type,
+            point.io_address,
+            temp,
+        )
+    else:
+        log.info(
+            "[%s] ЗАПРОС ЧТЕНИЯ на IOA %d | температура CPU: %.1f °C",
+            point.type,
+            point.io_address,
+            temp,
+        )
 
 
-def main():
-    # --- 1. Подготовка сервера и контролируемой станции ---
-    server = c104.Server()
-    station = server.add_station(common_address=47)
+# ─────────────────────────────────────────────
+# Конфигурация сервера
+# ─────────────────────────────────────────────
 
-    # --- 2. Подготовка точки мониторинга (Телеизмерение температуры) ---
-    # ВНИМАНИЕ: Изменен тип на M_ME_TF_1 для корректной передачи дробных чисел (градусов Цельсия)
-    point = station.add_point(io_address=11, type=c104.Type.M_ME_TF_1, report_ms=1000)
-    
-    point.on_before_auto_transmit(callable=before_auto_transmit)
-    point.on_before_read(callable=before_read)
+STATION_COMMON_ADDRESS: int = 47
+TEMP_IO_ADDRESS: int        = 11
+CMD_IO_ADDRESS: int         = 12
+REPORT_INTERVAL_MS: int     = 1000
+SERVER_IP: str              = "0.0.0.0"
+SERVER_PORT: int            = 2404
 
-    # --- 3. Подготовка точки управления (Телеуправление) ---
-    command = station.add_point(io_address=12, type=c104.Type.C_RC_TA_1)
-    command.on_receive(callable=on_step_command)
 
-    # --- 4. Запуск сервера и ожидание подключений ---
+# ─────────────────────────────────────────────
+# Точка входа
+# ─────────────────────────────────────────────
+
+def main() -> None:
+    global running
+
+    signal.signal(signal.SIGINT,  signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
+    log.info("=== Запуск IEC 60870-5-104 сервера ===")
+
+    # ── 1. Создание сервера ──────────────────
+    server = c104.Server(ip=SERVER_IP, port=SERVER_PORT)
+
+    # ── 2. Создание контролируемой станции ──
+    station = server.add_station(common_address=STATION_COMMON_ADDRESS)
+    log.info(
+        "Станция создана | CA=%d | %s:%d",
+        STATION_COMMON_ADDRESS,
+        SERVER_IP,
+        SERVER_PORT,
+    )
+
+    # ── 3. Точка мониторинга (температура) ──
+    temp_point: c104.Point = station.add_point(
+        io_address=TEMP_IO_ADDRESS,
+        type=c104.Type.M_ME_TF_1,
+        report_ms=REPORT_INTERVAL_MS,
+    )
+    temp_point.on_before_auto_transmit(callable=before_auto_transmit)
+    temp_point.on_before_read(callable=before_read)
+    log.info(
+        "Точка температуры | IOA=%d | тип=%s | период=%d мс",
+        TEMP_IO_ADDRESS,
+        c104.Type.M_ME_TF_1,
+        REPORT_INTERVAL_MS,
+    )
+
+    # ── 4. Точка управления (пошаговая команда) ──
+    cmd_point: c104.Point = station.add_point(
+        io_address=CMD_IO_ADDRESS,
+        type=c104.Type.C_RC_TA_1,
+    )
+    cmd_point.on_receive(callable=on_step_command)
+    log.info(
+        "Точка команды     | IOA=%d | тип=%s",
+        CMD_IO_ADDRESS,
+        c104.Type.C_RC_TA_1,
+    )
+
+    # ── 5. Запуск сервера ────────────────────
     server.start()
+    log.info("Сервер запущен. Ожидание подключений на %s:%d...", SERVER_IP, SERVER_PORT)
 
-    while not server.has_active_connections:
-        print("Ожидание подключения клиента...")
+    # ── 6. Ожидание первого подключения ─────
+    while running and not server.has_open_connections:
+        log.info("Нет активных клиентов, ждём...")
+        time.sleep(2)
+
+    if not running:
+        log.info("Завершение до появления клиентов.")
+        server.stop()
+        return
+
+    # ── 7. Основной цикл ─────────────────────
+    log.info("Клиент подключён. Начинаем трансляцию данных.")
+
+    while running:
+        if server.has_open_connections:
+            log.debug("Соединение активно.")
+        else:
+            log.warning("Все клиенты отключились. Ожидаем повторного подключения...")
         time.sleep(1)
 
-    time.sleep(1)
-
-    # --- 5. Основной рабочий цикл (Удержание работы) ---
-    c = 0
-    while server.has_open_connections and c < 30:
-        c += 1
-        print("Соединение активно, транслируем данные...")
-        time.sleep(1)
+    # ── 8. Завершение работы ─────────────────
+    log.info("Останавливаем сервер IEC 104...")
+    server.stop()
+    log.info("Сервер остановлен. До свидания!")
 
 
 if __name__ == "__main__":
